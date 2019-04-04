@@ -21,8 +21,12 @@ package com.sk89q.worldedit.extent.clipboard.io;
 
 import static com.google.common.base.Preconditions.checkNotNull;
 
+import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
 import com.sk89q.jnbt.ByteArrayTag;
 import com.sk89q.jnbt.CompoundTag;
+import com.sk89q.jnbt.DoubleTag;
+import com.sk89q.jnbt.FloatTag;
 import com.sk89q.jnbt.IntArrayTag;
 import com.sk89q.jnbt.IntTag;
 import com.sk89q.jnbt.ListTag;
@@ -30,9 +34,16 @@ import com.sk89q.jnbt.NBTOutputStream;
 import com.sk89q.jnbt.ShortTag;
 import com.sk89q.jnbt.StringTag;
 import com.sk89q.jnbt.Tag;
+import com.sk89q.worldedit.WorldEdit;
+import com.sk89q.worldedit.entity.BaseEntity;
+import com.sk89q.worldedit.extension.platform.Capability;
 import com.sk89q.worldedit.extent.clipboard.Clipboard;
+import com.sk89q.worldedit.math.BlockVector2;
 import com.sk89q.worldedit.math.BlockVector3;
+import com.sk89q.worldedit.math.Vector3;
 import com.sk89q.worldedit.regions.Region;
+import com.sk89q.worldedit.util.Location;
+import com.sk89q.worldedit.world.biome.BiomeType;
 import com.sk89q.worldedit.world.block.BaseBlock;
 
 import java.io.ByteArrayOutputStream;
@@ -63,17 +74,17 @@ public class SpongeSchematicWriter implements ClipboardWriter {
     @Override
     public void write(Clipboard clipboard) throws IOException {
         // For now always write the latest version. Maybe provide support for earlier if more appear.
-        outputStream.writeNamedTag("Schematic", new CompoundTag(write1(clipboard)));
+        outputStream.writeNamedTag("Schematic", new CompoundTag(write2(clipboard)));
     }
 
     /**
-     * Writes a version 1 schematic file.
+     * Writes a version 2 schematic file.
      *
      * @param clipboard The clipboard
      * @return The schematic map
      * @throws IOException If an error occurs
      */
-    private Map<String, Tag> write1(Clipboard clipboard) throws IOException {
+    private Map<String, Tag> write2(Clipboard clipboard) throws IOException {
         Region region = clipboard.getRegion();
         BlockVector3 origin = clipboard.getOrigin();
         BlockVector3 min = region.getMinimumPoint();
@@ -94,6 +105,8 @@ public class SpongeSchematicWriter implements ClipboardWriter {
 
         Map<String, Tag> schematic = new HashMap<>();
         schematic.put("Version", new IntTag(1));
+        schematic.put("DataVersion", new IntTag(
+                WorldEdit.getInstance().getPlatformManager().queryCapability(Capability.WORLD_EDITING).getDataVersion()));
 
         Map<String, Tag> metadata = new HashMap<>();
         metadata.put("WEOffsetX", new IntTag(offset.getBlockX()));
@@ -179,7 +192,98 @@ public class SpongeSchematicWriter implements ClipboardWriter {
         schematic.put("BlockData", new ByteArrayTag(buffer.toByteArray()));
         schematic.put("TileEntities", new ListTag(CompoundTag.class, tileEntities));
 
+        // version 2 stuff
+        if (clipboard.hasBiomes()) {
+            writeBiomes(clipboard, schematic);
+        }
+
+        if (!clipboard.getEntities().isEmpty()) {
+            writeEntities(clipboard, schematic);
+        }
+
         return schematic;
+    }
+
+    private void writeEntities(Clipboard clipboard, Map<String, Tag> schematic) {
+        List<Tag> entities = Lists.newArrayList();
+        clipboard.getEntities().forEach(e -> {
+            BaseEntity state = e.getState();
+            if (state == null) {
+                return;
+            }
+            Map<String, Tag> values = Maps.newHashMap();
+            CompoundTag rawData = state.getNbtData();
+            if (rawData != null) {
+                values.putAll(rawData.getValue());
+            }
+            values.remove("id");
+            values.put("Id", new StringTag(state.getType().getId()));
+            values.put("Pos", writeVector(e.getLocation().toVector()));
+            values.put("Rotation", writeRotation(e.getLocation()));
+
+            entities.add(new CompoundTag(values));
+        });
+        schematic.put("Entities", new ListTag(CompoundTag.class, entities));
+    }
+
+    private void writeBiomes(Clipboard clipboard, Map<String, Tag> schematic) {
+        BlockVector3 min = clipboard.getMinimumPoint();
+        int width = clipboard.getRegion().getWidth();
+        int length = clipboard.getRegion().getLength();
+
+        ByteArrayOutputStream buffer = new ByteArrayOutputStream(width * length);
+
+        int paletteMax = 0;
+        Map<String, Integer> palette = new HashMap<>();
+
+        // TODO this technically should be 3D per the spec
+        for (int z = 0; z < length; z++) {
+            int z0 = min.getBlockZ() + z;
+            for (int x = 0; x < width; x++) {
+                int x0 = min.getBlockX() + x;
+                BlockVector2 pt = BlockVector2.at(x, z);
+                BiomeType biome = clipboard.getBiome(pt);
+
+                String biomeKey = biome.getId();
+                int biomeId;
+                if (palette.containsKey(biomeKey)) {
+                    biomeId = palette.get(biomeKey);
+                } else {
+                    biomeId = paletteMax;
+                    palette.put(biomeKey, biomeId);
+                    paletteMax++;
+                }
+
+                while ((biomeId & -128) != 0) {
+                    buffer.write(biomeId & 127 | 128);
+                    biomeId >>>= 7;
+                }
+                buffer.write(biomeId);
+            }
+        }
+
+        schematic.put("BiomePaletteMax", new IntTag(paletteMax));
+
+        Map<String, Tag> paletteTag = new HashMap<>();
+        palette.forEach((key, value) -> paletteTag.put(key, new IntTag(value)));
+
+        schematic.put("BiomePalette", new CompoundTag(paletteTag));
+        schematic.put("BiomeData", new ByteArrayTag(buffer.toByteArray()));
+    }
+
+    private Tag writeVector(Vector3 vector) {
+        List<DoubleTag> list = new ArrayList<DoubleTag>();
+        list.add(new DoubleTag(vector.getX()));
+        list.add(new DoubleTag(vector.getY()));
+        list.add(new DoubleTag(vector.getZ()));
+        return new ListTag(DoubleTag.class, list);
+    }
+
+    private Tag writeRotation(Location location) {
+        List<FloatTag> list = new ArrayList<FloatTag>();
+        list.add(new FloatTag(location.getYaw()));
+        list.add(new FloatTag(location.getPitch()));
+        return new ListTag(FloatTag.class, list);
     }
 
     @Override
